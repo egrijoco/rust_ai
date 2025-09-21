@@ -1,0 +1,31 @@
+# Alap könyvtárak
+requests>=2.32.0
+beautifulsoup4>=4.13.0
+soupsieve>=2.5
+urllib3>=2.2.0
+
+# Adatkezelés és -elemzés
+pandas>=2.0.0           # Adatmanipuláció és -elemzés :cite[3]
+numpy>=1.24.0           # Numerikus számítások :cite[3]
+scikit-learn>=1.0.0     # Gépi tanulás :cite[3]
+
+# Aszinkron kérések
+aiohttp>=3.9.0          # Aszinkron HTTP kliens/szerver
+
+# Környezeti változók kezelése
+python-dotenv>=1.0.0    # .env fájl támogatás :cite[3]
+
+# Naplózás
+loguru>=0.7.0           # Egyszerű és hatékony naplózás
+
+# JSON kezelés
+json5>=0.9.0            # JSON bővítmények támogatása
+
+# Progress bar
+tqdm>=4.65.0            # Folyamatjelző sávok
+
+# Dátum/idő kezelés
+python-dateutil>=2.8.0  # Dátum manipuláció
+
+# Type hinting
+typing-extensions>=4.5.0 # Típusjelzések bővítményei

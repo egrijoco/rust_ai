@@ -1,0 +1,15 @@
+﻿venv/
+index/
+__pycache__/
+*.log
+*.zip
+*.tmp
+*.bak
+.env
+.DS_Store
+.idea/
+.vscode/
+*.npy
+*.npz
+*.pt
+*.bin

@@ -1,0 +1,22 @@
+{
+  "small rechargeable battery": {
+    "display_name": "Battery - Small",
+    "mechanics": {
+      "capacity": "400 rWm",
+      "max_output": "15 rW"
+    },
+    "sources": {
+      "docx_handbook": true
+    }
+  },
+  "large rechargeable battery": {
+    "display_name": "Battery - Large",
+    "mechanics": {
+      "capacity": "24,000 rWm",
+      "max_output": "100 rW"
+    },
+    "sources": {
+      "docx_handbook": true
+    }
+  }
+}
