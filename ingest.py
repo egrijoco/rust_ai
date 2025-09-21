@@ -1,31 +1,20 @@
-# ingest.py
-# HYBRID+LEXICON indexépítő Rust HU RAG bothoz
-# - E:\Rust_Ai\data alól (rekurzívan) minden *.json beolvasása
-# - HU→EN alias-lexikon
-# - Embedding: intfloat/multilingual-e5-base (env-ből felülírható)
-# - FAISS (dense) + BOW (CountVectorizer) index
-# - Meta: docs, vocab, lexicon, beállítások
-
+# ingest.py – E:\Rust_Ai\data beolvasás, egyesítés, index építés
 import os
-import json
 import re
+import json
+import glob
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, List, Any, Tuple
 
 import numpy as np
-from tqdm import tqdm
-from sentence_transformers import SentenceTransformer
+
+# --- BoW / Embedding / FAISS ---
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.preprocessing import normalize
+from scipy.sparse import csr_matrix, save_npz
 from dotenv import load_dotenv
+from pathlib import Path
 
-# a többi import fölé/alá mehet
-try:
-    from docx import Document
-    HAVE_DOCX = True
-except Exception:
-    HAVE_DOCX = False
-
-
-# FAISS vagy sklearn fallback
 try:
     import faiss  # type: ignore
     HAVE_FAISS = True
@@ -33,242 +22,417 @@ except Exception:
     HAVE_FAISS = False
     from sklearn.neighbors import NearestNeighbors  # type: ignore
 
-# BOW
-from sklearn.feature_extraction.text import CountVectorizer
-from sklearn.preprocessing import normalize
-from scipy.sparse import save_npz
+from sentence_transformers import SentenceTransformer
 
-load_dotenv()
+# DOCX (opcionális)
+try:
+    from docx import Document  # type: ignore
+    HAVE_DOCX = True
+except Exception:
+    HAVE_DOCX = False
 
-# ----- Fix forrásmappa: E:\Rust_Ai\data (env-ből felülírható) -----
-DATA_DIR = Path(os.getenv("RAG_DATA_DIR", r"E:\Rust_Ai\data")).resolve()
 
 BASE = Path(__file__).parent.resolve()
-INDEX_DIR = (BASE / "index")
+load_dotenv(dotenv_path=BASE / ".env")
+DATA_DIR = Path(os.getenv("RAG_DATA_DIR", str(BASE / "data")))
+INDEX_DIR = BASE / "index"
 INDEX_DIR.mkdir(parents=True, exist_ok=True)
 
-FAISS_FILE = INDEX_DIR / "faiss.index"
-SK_VECS_FILE = INDEX_DIR / "sk_vectors.npy"
-META_FILE = INDEX_DIR / "meta.json"
-TFIDF_MATRIX_FILE = INDEX_DIR / "tfidf_matrix.npz"
-TFIDF_VOCAB_FILE = INDEX_DIR / "tfidf_vocab.json"
-LEXICON_FILE = INDEX_DIR / "lexicon.json"
-
-# Modell és hibrid súlyok env-ből állíthatók
-MODEL_NAME = os.getenv("RAG_EMB_MODEL", "intfloat/multilingual-e5-base")
+# ENV beállítások
+EMB_MODEL = os.getenv("RAG_EMB_MODEL", "intfloat/multilingual-e5-base")
 HYBRID_ALPHA = float(os.getenv("RAG_HYBRID_ALPHA", "0.6"))
 DENSE_K = int(os.getenv("RAG_DENSE_K", "8"))
-LEXICAL_K = int(os.getenv("RAG_LEXICAL_K", "10"))
+LEX_K = int(os.getenv("RAG_LEXICAL_K", "10"))
 
-# Kézi HU alias magok (bővíthető)
-HU_ALIASES_SEED: Dict[str, List[str]] = {
-    "Large Solar Panel": ["napelem", "nagy napelem", "solar panel", "nagy solar"],
-    "Small Battery": ["kis akku", "kis akkumulátor", "small battery"],
-    "Large Battery": ["nagy akku", "nagy akkumulátor", "large battery"],
-    "Root Combiner": ["root combiner", "összegző", "forrásösszegző", "kombinátor"],
-    "Electrical Branch": ["branch", "ágaztató", "elosztó ág", "elektromos branch"],
-    "Power Splitter": ["splitter", "elosztó", "power splitter"],
-    "Power Blocker": ["blocker", "blokkoló"],
-    "Smart Switch": ["okos kapcsoló", "smart switch"],
-    "Switch": ["kapcsoló", "switch"],
-    "Timer": ["időzítő", "timer"],
-    "Wind Turbine": ["szélkerék", "szélturbina", "wind turbine"],
-    "HBHF Sensor": ["mozgásérzékelő", "hbhf", "sensor"],
-    
-}
+# Kimeneti fájlok
+META_FILE = INDEX_DIR / "meta.json"
+FAISS_FILE = INDEX_DIR / "faiss.index"
+SK_VECS_FILE = INDEX_DIR / "sk_vectors.npy"
+BOW_MATRIX_FILE = INDEX_DIR / "tfidf_matrix.npz"
+BOW_VOCAB_FILE = INDEX_DIR / "tfidf_vocab.json"
+LEXICON_FILE = INDEX_DIR / "lexicon.json"
+CATALOG_FILE = INDEX_DIR / "catalog.json"
 
+# ---------- segédek ----------
 def _norm(s: str) -> str:
-    s = s.lower().strip()
+    s = (s or "").lower().strip()
     s = re.sub(r"\(.*?\)", "", s)
     s = re.sub(r"[^a-z0-9áéíóöőúüű \-]", " ", s)
     s = re.sub(r"\s+", " ", s)
     return s
 
-def _norm_key(row: Dict[str, Any], fallback: str = "") -> str:
-    def first(*keys):
-        for k in keys:
-            v = row.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip().lower()
-        return ""
-    key = first("short_name", "shortName", "display_name", "displayName")
-    return key or (fallback.strip().lower() if fallback else "")
-
-def _merge_base_fields(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
-    mapping = {
-        "display_name": ["display_name", "displayName"],
-        "short_name":   ["short_name", "shortName"],
-        "item_id":      ["item_id", "itemId", "id"],
-        "category":     ["category"],
-        "desc_short":   ["desc_short", "description"],
-        "image":        ["image", "icon", "iconUrl"],
-    }
-    for dst_key, candidates in mapping.items():
-        if not dst.get(dst_key):
-            for ck in candidates:
-                val = src.get(ck)
-                if val is not None and val != "":
-                    dst[dst_key] = val
-                    break
-
-def load_all_items() -> Dict[str, Dict[str, Any]]:
-    files = sorted(DATA_DIR.rglob("*.json"))  # rekurzív
-    if not files:
-        raise FileNotFoundError(f"Nincs .json a forrásmappában: {DATA_DIR}")
-    merged: Dict[str, Dict[str, Any]] = {}
-    print(f"[LOAD] {len(files)} JSON fájl → {DATA_DIR}")
-    for p in files:
+def _read_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
         try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-        except Exception as e:
-            print(f"[WARN] {p.name} kihagyva (JSON hiba): {e}")
-            continue
-        if isinstance(data, dict):
-            iterable = [(k, v) for k, v in data.items() if isinstance(v, dict)]
-        elif isinstance(data, list):
-            iterable = [(str(i), v) for i, v in enumerate(data) if isinstance(v, dict)]
-        else:
-            continue
-        before = len(merged)
-        for k, row in iterable:
-            key = _norm_key(row, k)
+            return json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            return None
+
+def _as_lines(d: Dict[str, Any], keys_top: List[str]) -> str:
+    """Kiválasztott kulcsok rendezett megjelenítése; fallback: rövid pretty JSON."""
+    lines = []
+    for k in keys_top:
+        v = d.get(k)
+        if v is not None and v != "":
+            if isinstance(v, (dict, list)):
+                try:
+                    v = json.dumps(v, ensure_ascii=False)
+                except Exception:
+                    v = str(v)
+            lines.append(f"{k}: {v}")
+    if not lines:
+        # rövid fallback
+        try:
+            js = json.dumps(d, ensure_ascii=False)
+            return js[:3000]
+        except Exception:
+            return str(d)[:3000]
+    return "\n".join(lines)
+
+# ---------- Forrás-parszolók ----------
+def parse_rusthelp_items(data: Any) -> List[Dict[str, Any]]:
+    """RustHelp admin-item-list-public.json / item-list-public.json"""
+    out = []
+    rows = []
+    if isinstance(data, list):
+        rows = data
+    elif isinstance(data, dict):
+        rows = list(data.values())
+    for r in rows:
+        dn = r.get("displayName") or r.get("display_name") or r.get("name")
+        sn = r.get("shortName") or r.get("short_name")
+        iid = r.get("itemId") or r.get("id")
+        cat = r.get("category") or r.get("Category") or r.get("type")
+        desc = r.get("description") or r.get("desc") or ""
+        if dn or sn:
+            out.append({
+                "display_name": dn or sn,
+                "short_name": sn,
+                "item_id": iid,
+                "category": cat,
+                "description": desc,
+                "sources": {"rusthelp": True},
+            })
+    return out
+
+def parse_rustplusplus_items(data: Any) -> List[Dict[str, Any]]:
+    """
+    RustPlusPlus staticFiles/items.json – tipikusan id->objektum mapping,
+    mezők: name, shortname, description, (néha) category.
+    """
+    out = []
+    if isinstance(data, dict):
+        values = list(data.values())
+    elif isinstance(data, list):
+        values = data
+    else:
+        values = []
+    for r in values:
+        dn = r.get("name") or r.get("display_name")
+        sn = r.get("shortname") or r.get("short_name")
+        iid = r.get("id") or r.get("itemId")
+        cat = r.get("category")
+        desc = r.get("description") or ""
+        if dn or sn:
+            out.append({
+                "display_name": dn or sn,
+                "short_name": sn,
+                "item_id": iid,
+                "category": cat,
+                "description": desc,
+                "sources": {"rustplusplus": True},
+            })
+    return out
+
+def parse_rustlabs_data(files: Dict[str, Path]) -> Dict[str, Dict[str, Any]]:
+    """
+    Visszaad: short_name -> mechanics kiegészítések (stack, recycle, smelt, despawn, durability, upkeep, decay…)
+    Elfogad bármelyik meglévő rustlabs*Data*.json fájlt (ha nincs, kihagyja).
+    """
+    mech: Dict[str, Dict[str, Any]] = {}
+    def up(sn: str, key: str, val: Any):
+        if not sn:
+            return
+        node = mech.setdefault(sn, {})
+        if isinstance(val, (dict, list)):
+            node[key] = val
+        elif val is not None:
+            node[key] = val
+
+    # Stack
+    p = files.get("stack")
+    if p:
+        data = _read_json(p) or {}
+        # várható: { shortname: stacksize, ... }
+        for sn, stack in data.items():
+            up(sn, "stack_size", stack)
+
+    # Recycle
+    p = files.get("recycle")
+    if p:
+        data = _read_json(p) or {}
+        # formátum: { shortname: [{item,amount,prob}, ...] }
+        for sn, arr in data.items():
+            up(sn, "recycles_into", arr)
+
+    # Smelting
+    p = files.get("smelting")
+    if p:
+        data = _read_json(p) or {}
+        for sn, arr in data.items():
+            up(sn, "smelting", arr)
+
+    # Despawn
+    p = files.get("despawn")
+    if p:
+        data = _read_json(p) or {}
+        for sn, secs in data.items():
+            up(sn, "despawn_seconds", secs)
+
+    # Durability
+    p = files.get("durability")
+    if p:
+        data = _read_json(p) or {}
+        for sn, info in data.items():
+            up(sn, "durability", info)
+
+    # Decay & Upkeep
+    p = files.get("decay")
+    if p:
+        data = _read_json(p) or {}
+        up("__global__", "decay", data)
+    p = files.get("upkeep")
+    if p:
+        data = _read_json(p) or {}
+        up("__global__", "upkeep", data)
+
+    # Craft
+    p = files.get("craft")
+    if p:
+        data = _read_json(p) or {}
+        for sn, info in data.items():
+            up(sn, "crafting", info)
+
+    return mech
+
+# ---------- Adatbetöltés ----------
+def collect_items_and_docs(data_dir: Path) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Visszaad:
+      items: kanonikus item rekordok listája (display_name, short_name, item_id, category, description, mechanics)
+      docs:  kereshető dokumentumok listája (id, title, content, category)
+    """
+    items: Dict[str, Dict[str, Any]] = {}
+    docs: List[Dict[str, Any]] = []
+
+    # 1) RustHelp listák
+    for fp in glob.glob(str(data_dir / "*item*list*.json")) + glob.glob(str(data_dir / "*admin*item*list*.json")):
+        data = _read_json(Path(fp))
+        for it in parse_rusthelp_items(data):
+            key = _norm(it.get("short_name") or it.get("display_name") or "")
             if not key:
                 continue
-            dst = merged.setdefault(key, {})
-            _merge_base_fields(dst, row)
-            if isinstance(row.get("desc_long"), str) and row["desc_long"].strip():
-                if len(row["desc_long"]) > len(dst.get("desc_long", "") or ""):
-                    dst["desc_long"] = row["desc_long"]
-            if isinstance(row.get("mechanics"), dict):
-                dst.setdefault("mechanics", {}).update(row["mechanics"])
-            dst.setdefault("sources", {})[p.stem] = True
-        print(f"[LOAD] {p.name}: +{len(merged)-before} új/egyesített")
-    print(f"[LOAD] Összesen {len(merged)} tétel")
-    return merged
+            base = items.setdefault(key, {"mechanics": {}, "sources": {}})
+            for k in ("display_name","short_name","item_id","category","description"):
+                if it.get(k) and not base.get(k):
+                    base[k] = it[k]
+            base["sources"]["rusthelp"] = True
 
-def _aliases_for_item(display: str, short: str) -> List[str]:
-    al = set()
-    if display:
-        al.add(display); al.add(_norm(display)); al.add(display.lower())
-    if short:
-        al.add(short); al.add(_norm(short)); al.add(short.lower())
-    for tok in (display or "").replace("-", " ").split():
-        if len(tok) > 2:
-            al.add(tok.lower())
-    return sorted(a for a in al if a)
+    # 2) RustPlusPlus staticFiles (ha letöltötted ide: data/rustplusplus/*.json)
+    rpp_dir = data_dir / "rustplusplus"
+    if rpp_dir.exists():
+        # items.json
+        for fp in glob.glob(str(rpp_dir / "items*.json")):
+            data = _read_json(Path(fp))
+            for it in parse_rustplusplus_items(data):
+                key = _norm(it.get("short_name") or it.get("display_name") or "")
+                if not key:
+                    continue
+                base = items.setdefault(key, {"mechanics": {}, "sources": {}})
+                for k in ("display_name","short_name","item_id","category","description"):
+                    if it.get(k) and not base.get(k):
+                        base[k] = it[k]
+                base["sources"]["rustplusplus"] = True
 
-def build_documents_and_lexicon(items: Dict[str, Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, List[int]]]:
-    docs: List[Dict[str, Any]] = []
-    lexicon: Dict[str, List[int]] = {}
+    # 3) RustLabs *Data.json – mechanics
+    rl_files = {
+        "stack": next((Path(p) for p in glob.glob(str(data_dir / "rustlabsStackData*.json"))), None),
+        "recycle": next((Path(p) for p in glob.glob(str(data_dir / "rustlabsRecycleData*.json"))), None),
+        "smelting": next((Path(p) for p in glob.glob(str(data_dir / "rustlabsSmeltingData*.json"))), None),
+        "despawn": next((Path(p) for p in glob.glob(str(data_dir / "rustlabsDespawnData*.json"))), None),
+        "durability": next((Path(p) for p in glob.glob(str(data_dir / "rustlabsDurabilityData*.json"))), None),
+        "decay": next((Path(p) for p in glob.glob(str(data_dir / "rustlabsDecayData*.json"))), None),
+        "upkeep": next((Path(p) for p in glob.glob(str(data_dir / "rustlabsUpkeepData*.json"))), None),
+        "craft": next((Path(p) for p in glob.glob(str(data_dir / "rustlabsCraftData*.json"))), None),
+    }
+    rl_files = {k:v for k,v in rl_files.items() if v}
+    if rl_files:
+        mech_map = parse_rustlabs_data(rl_files)  # short_name -> mechanics
+        for sn, mech in mech_map.items():
+            if sn == "__global__":
+                # globális info (decay/upkeep) – berakjuk külön docnak is
+                docs.append({
+                    "id": f"rustlabs_global_{list(mech.keys())}",
+                    "title": "RustLabs – Global Base Mechanics (decay/upkeep)",
+                    "content": _as_lines(mech, list(mech.keys())),
+                    "category": "mechanics",
+                })
+                continue
+            key = _norm(sn)
+            base = items.setdefault(key, {"mechanics": {}, "sources": {}})
+            base["mechanics"].update(mech)
+            base["sources"]["rustlabs"] = True
 
-    fields = [
-    ("io", "I/O"),
-    ("power_output", "Power Output"),
-    ("power_consumption", "Power Consumption"),
-    ("active_usage", "Active Usage"),
-    ("capacity", "Kapacitás"),            # ÚJ
-    ("charge_rate", "Töltési ráta"),      # ÚJ
-    ("max_output", "Max kimenet"),        # ÚJ
-    ("crafting", "Crafting"),
-    ("recycles_into", "Recycle"),
-    ("stack_size", "Stack Size"),
-    ("workbench_required", "Workbench"),
-    ("workbench_required_level", "WB Level"),
-    ("research_cost", "Research Scrap"),
-    ("fuel_consumption", "Fuel Consumption"),
-    ]
+    # 4) DOCX/TXT/MD – sima dokumentumok
+    for fp in glob.glob(str(data_dir / "**/*.docx"), recursive=True) if HAVE_DOCX else []:
+        try:
+            doc = Document(fp)
+            text = "\n".join(p.text for p in doc.paragraphs)
+            title = Path(fp).stem
+            if text.strip():
+                docs.append({"id": fp, "title": title, "content": text[:120000], "category": "doc"})
+        except Exception:
+            pass
 
+    for pattern in ("**/*.txt", "**/*.md"):
+        for fp in glob.glob(str(data_dir / pattern), recursive=True):
+            try:
+                text = Path(fp).read_text(encoding="utf-8", errors="ignore")
+                title = Path(fp).stem
+                if text.strip():
+                    docs.append({"id": fp, "title": title, "content": text[:120000], "category": "doc"})
+            except Exception:
+                pass
 
-    print("[BUILD] Dokumentumok + lexikon…")
-    for k, it in tqdm(items.items()):
-        name = it.get("display_name") or it.get("short_name") or k
-        short = it.get("short_name") or ""
-        mech = it.get("mechanics", {}) or {}
-        rustrician_url = mech.get("rustrician_url")
-
-        parts: List[str] = [f"Név: {name}"]
-        if it.get("category"): parts.append(f"Kategória: {it['category']}")
-        if it.get("desc_long"): parts.append(f"Leírás: {it['desc_long']}")
-        elif it.get("desc_short"): parts.append(f"Leírás: {it['desc_short']}")
-        for fld, label in fields:
-            val = mech.get(fld)
-            if val: parts.append(f"{label}: {val}")
-
-        content = "\n".join(parts)
-        doc = {
-            "id": k,
-            "title": name,
+    # 5) Item rekordokból generált „doc” (kereshető kivonat)
+    for key, it in items.items():
+        title = it.get("display_name") or it.get("short_name") or key
+        content = _as_lines({
+            "short_name": it.get("short_name"),
+            "item_id": it.get("item_id"),
+            "category": it.get("category"),
+            "description": it.get("description"),
+            "mechanics": it.get("mechanics"),
+        }, ["short_name","item_id","category","description","mechanics"])
+        docs.append({
+            "id": f"item::{key}",
+            "title": title,
             "content": content,
-            "url": rustrician_url,
-            "sources": list((it.get("sources") or {}).keys())
-        }
-        docs.append(doc)
-        idx = len(docs) - 1
+            "category": it.get("category") or "item"
+        })
 
-        als = _aliases_for_item(name, short)
-        if name in HU_ALIASES_SEED: als.extend(HU_ALIASES_SEED[name])
+    # 6) Maradék JSON-ok mint „nyers” doc (ha még nincs dokumentumban)
+    for fp in glob.glob(str(data_dir / "**/*.json"), recursive=True):
+        p = Path(fp)
+        # kihagyjuk a már feldolgozott tipikus fájlokat
+        name = p.name.lower()
+        if any(x in name for x in ["item-list", "admin-item-list", "items.json",
+                                   "rustlabs", "blueprint", "stack", "recycle",
+                                   "smelting", "despawn", "durability", "decay", "upkeep", "craft"]):
+            continue
+        try:
+            txt = p.read_text(encoding="utf-8", errors="ignore")
+            if txt.strip():
+                docs.append({"id": fp, "title": p.stem, "content": txt[:120000], "category": "raw"})
+        except Exception:
+            pass
 
-        for a in set(als):
-            for key in {a, _norm(a)}:
-                if not key: continue
-                lexicon.setdefault(key, [])
-                if idx not in lexicon[key]:
-                    lexicon[key].append(idx)
+    # Katalógus
+    catalog = []
+    for key, it in items.items():
+        catalog.append({
+            "display_name": it.get("display_name") or it.get("short_name") or key,
+            "short_name": it.get("short_name"),
+            "item_id": it.get("item_id"),
+            "category": it.get("category") or "",
+        })
 
-    return docs, lexicon
+    return catalog, docs
 
-def build_bow(docs: List[Dict[str, Any]], lexicon: Dict[str, List[int]]):
-    corpus: List[str] = []
-    for i, d in enumerate(docs):
-        aliases_here = [k for k, arr in lexicon.items() if i in arr]
-        text = d["content"] + "\naliases: " + " ".join(sorted(set(aliases_here)))
-        corpus.append(text)
-
-    print("[BOW] Vectorizer tanítása + mátrix…")
-    vec = CountVectorizer(lowercase=True, ngram_range=(1, 2), min_df=1)
-    X = vec.fit_transform(corpus)
+# ---------- Index építés ----------
+def build_bow(docs: List[Dict[str, Any]]) -> Tuple[CountVectorizer, csr_matrix, Dict[str,int]]:
+    texts = [ _norm(d.get("title","") + " " + d.get("content","")) for d in docs ]
+    vectorizer = CountVectorizer(ngram_range=(1,2), min_df=1, max_features=80000)
+    X = vectorizer.fit_transform(texts)
     X = normalize(X, norm="l2", copy=False)
-    save_npz(TFIDF_MATRIX_FILE, X)
-    TFIDF_VOCAB_FILE.write_text(json.dumps(vec.vocabulary_, ensure_ascii=False), encoding="utf-8")
-    print(f"[BOW] Kész: {X.shape[0]} doksi, {X.shape[1]} szó")
+    vocab = vectorizer.vocabulary_
+    return vectorizer, X, vocab
 
-def main():
-    print(f"[SRC] Forrásmappa: {DATA_DIR}")
-    items = load_all_items()
-    docs, lexicon = build_documents_and_lexicon(items)
+def build_dense(docs: List[Dict[str, Any]]) -> np.ndarray:
+    model = SentenceTransformer(EMB_MODEL)
+    texts = [ "passage: " + (d.get("title","") + "\n" + d.get("content",""))[:4000] for d in docs ]
+    emb = model.encode(texts, show_progress_bar=True, normalize_embeddings=True).astype(np.float32)
+    return emb
 
-    print(f"[EMBED] Modell: {MODEL_NAME}")
-    model = SentenceTransformer(MODEL_NAME)
-    texts = ["passage: " + d["content"] for d in docs]
-    emb = model.encode(texts, normalize_embeddings=True, batch_size=64, show_progress_bar=True).astype(np.float32)
-    dim = emb.shape[1]
+def build_faiss(emb: np.ndarray):
+    index = faiss.IndexFlatIP(emb.shape[1])
+    index.add(emb)
+    faiss.write_index(index, str(FAISS_FILE))
 
-    if HAVE_FAISS:
-        print("[INDEX] FAISS (IP a normalizált vektorokon)…")
-        index = faiss.IndexFlatIP(dim)
-        index.add(emb)
-        faiss.write_index(index, str(FAISS_FILE))
-    else:
-        print("[INDEX] sklearn NN fallback (cosine)…")
-        # Csak a vektorokat mentjük; a NN-t a lekérdező tölti be
-        np.save(SK_VECS_FILE, emb)
-
-    build_bow(docs, lexicon)
-
-    META_FILE.write_text(json.dumps({
-        "model": MODEL_NAME,
+def save_meta(docs: List[Dict[str, Any]]):
+    meta = {
+        "model": EMB_MODEL,
         "faiss": HAVE_FAISS,
-        "dim": int(dim),
         "docs": docs,
         "settings": {
-        "hybrid_alpha": HYBRID_ALPHA,
-        "dense_k": DENSE_K,
-        "lexical_k": LEXICAL_K
+            "hybrid_alpha": HYBRID_ALPHA,
+            "dense_k": DENSE_K,
+            "lexical_k": LEX_K
         }
-    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    }
+    META_FILE.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
 
-    LEXICON_FILE.write_text(json.dumps(lexicon, ensure_ascii=False, indent=2), encoding="utf-8")
-    print("[KÉSZ] Index + lexikon kész:", INDEX_DIR)
+def build_lexicon(docs: List[Dict[str, Any]]) -> Dict[str, List[int]]:
+    lex: Dict[str, List[int]] = {}
+    def add(k: str, idx: int):
+        k = _norm(k)
+        if not k:
+            return
+        lex.setdefault(k, []).append(idx)
+
+    for i, d in enumerate(docs):
+        t = d.get("title") or ""
+        add(t, i)
+        # item nevek szétbontva
+        for token in re.split(r"[/\-–:,]", t):
+            add(token, i)
+    return lex
+
+def main():
+    print(f"[INGEST] DATA_DIR: {DATA_DIR}")
+    catalog, docs = collect_items_and_docs(DATA_DIR)
+    print(f"[INGEST] items a katalógusban: {len(catalog)} | dokumentumok: {len(docs)}")
+
+    # Katalógus mentése
+    CATALOG_FILE.write_text(json.dumps(catalog, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[INGEST] catalog.json mentve ({CATALOG_FILE})")
+
+    # BoW
+    vectorizer, X, vocab = build_bow(docs)
+    save_npz(str(BOW_MATRIX_FILE), X)
+    safe_vocab = {k: int(v) for k, v in vocab.items()}
+    BOW_VOCAB_FILE.write_text(json.dumps(safe_vocab, ensure_ascii=False), encoding="utf-8")
+
+    print(f"[INGEST] BoW kész: {X.shape}")
+
+    # Dense
+    emb = build_dense(docs)
+    np.save(str(SK_VECS_FILE), emb)
+    print(f"[INGEST] Dense vektorok: {emb.shape}")
+
+    if HAVE_FAISS:
+        build_faiss(emb)
+        print(f"[INGEST] FAISS index mentve: {FAISS_FILE}")
+    else:
+        print("[INGEST] FAISS nincs, sklearn fallback marad.")
+
+    # Meta & Lexikon
+    save_meta(docs)
+    lex = build_lexicon(docs)
+    LEXICON_FILE.write_text(json.dumps(lex, ensure_ascii=False), encoding="utf-8")
+    print(f"[INGEST] meta.json + lexicon.json kész.")
 
 if __name__ == "__main__":
     main()
